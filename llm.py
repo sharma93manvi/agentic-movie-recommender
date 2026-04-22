@@ -58,6 +58,14 @@ for _, row in MOVIES_DF.iterrows():
 # Valid TMDB IDs (for safety check)
 VALID_IDS = set(MOVIES_DF["tmdb_id"].astype(int))
 
+# Collect all unique genres for fuzzy matching
+ALL_GENRES = set()
+for g in MOVIES_DF["genres"].dropna():
+    for genre in g.split(", "):
+        genre = genre.strip().lower()
+        if genre:
+            ALL_GENRES.add(genre)
+
 # ---------------------------------------------------------------------------
 # Retrieval: score-based candidate shortlisting
 # ---------------------------------------------------------------------------
@@ -239,9 +247,23 @@ def _score_movies(preferences: str, history_ids: set[int]) -> pd.DataFrame:
     for term in search_terms:
         if term in GENRE_SYNONYMS:
             target_genres.update(GENRE_SYNONYMS[term])
+    # Also check multi-word synonym keys against full preference text
     for key, genres in GENRE_SYNONYMS.items():
         if key in pref_lower:
             target_genres.update(genres)
+
+    # --- Fuzzy genre matching for typos/gibberish ---
+    # If no exact matches, try to detect genre hints in garbled text
+    if not target_genres:
+        for term in search_terms:
+            # Check if synonym keys appear as substrings
+            for key, genres in GENRE_SYNONYMS.items():
+                if len(key) >= 5 and key in term:
+                    target_genres.update(genres)
+            # Check if genre names appear as substrings
+            for genre in ALL_GENRES:
+                if len(genre) >= 5 and genre in term:
+                    target_genres.add(genre)
 
     # --- "Like X" reference matching ---
     # If user mentions a specific movie, boost movies with similar genres/keywords
@@ -354,15 +376,13 @@ def _format_movie(row) -> str:
     if row.director:
         parts.append(f"Director: {row.director}")
     if row.top_cast:
-        cast_list = [c.strip() for c in row.top_cast.split(",")][:3]
+        cast_list = [c.strip() for c in row.top_cast.split(",")][:2]
         parts.append(f"Cast: {', '.join(cast_list)}")
     if row.vote_average and row.vote_count:
         parts.append(f"Rating: {row.vote_average}/10 ({int(row.vote_count)} votes)")
-    if row.tagline:
-        parts.append(f'Tagline: "{row.tagline}"')
     if row.overview:
-        parts.append(f"Overview: {row.overview[:150]}")
-    return "\n  ".join(parts)
+        parts.append(f"Plot: {row.overview[:120]}")
+    return " | ".join(parts)
 
 
 def _build_prompt(preferences: str, history: list[str], history_ids: list[int],
@@ -379,25 +399,16 @@ def _build_prompt(preferences: str, history: list[str], history_ids: list[int],
         ) if history else "none"
     )
 
-    prompt = f"""You are a passionate movie critic helping someone find their next favorite film.
+    prompt = f"""Pick the best movie for this user. Write a compelling, personalized description (≤500 chars).
 
 User wants: "{preferences}"
-Already watched (do NOT pick these): {history_text}
+Already watched (do NOT pick): {history_text}
 
-Candidates (pick exactly ONE):
-
+Candidates:
 {movie_list}
 
-RULES:
-- Pick the movie that BEST matches their preferences, mood, and taste.
-- Write a personalized description (≤500 chars) that:
-  * Opens by connecting to what they asked for
-  * Highlights what makes THIS movie special (don't just summarize the plot)
-  * Mentions specific elements (director, actors, themes) that align with their request
-  * Ends with a hook that makes them want to press play right now
-- Do NOT pick a movie from the "already watched" list.
-
-Return ONLY valid JSON: {{"tmdb_id": <int>, "description": "<text>"}}"""
+Pick one. Connect description to their preferences. Be specific and engaging.
+Return ONLY JSON: {{"tmdb_id": <int>, "description": "<text>"}}"""
     return prompt
 
 
@@ -445,7 +456,7 @@ def get_recommendation(preferences: str, history: list[str], history_ids: list[i
         model=MODEL,
         messages=[{"role": "user", "content": prompt}],
         format="json",
-        options={"num_predict": 300},
+        options={"num_predict": 200, "temperature": 0},
     )
 
     result = _parse_llm_response(response.message.content)
