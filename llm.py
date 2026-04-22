@@ -365,6 +365,7 @@ def _get_client() -> ollama.Client:
     return ollama.Client(
         host="https://ollama.com",
         headers={"Authorization": f"Bearer {os.environ['OLLAMA_API_KEY']}"},
+        timeout=15.0,
     )
 
 
@@ -448,25 +449,65 @@ def get_recommendation(preferences: str, history: list[str], history_ids: list[i
     scored = _score_movies(preferences, history_id_set)
     candidates = scored.head(6)
 
-    # Stage 2: LLM picks the best match and writes description
-    prompt = _build_prompt(preferences, history, history_ids, candidates)
+    # Check if retrieval found any real signal (genre/text/theme matches)
+    top_row = candidates.iloc[0]
+    has_signal = (top_row["_genre_score"] > 0 or top_row["_text_score"] > 0 or
+                  top_row["_theme_score"] > 0 or top_row["_ref_score"] > 0)
+
+    if has_signal:
+        # Normal path: LLM picks from shortlisted candidates
+        prompt = _build_prompt(preferences, history, history_ids, candidates)
+    else:
+        # Low-signal path: input is vague/gibberish, use a simpler prompt
+        # with top-quality movies so the LLM doesn't overthink
+        movie_blocks = []
+        for row in candidates.itertuples():
+            movie_blocks.append(f"- {_format_movie(row)}")
+        movie_list = "\n".join(movie_blocks)
+        history_text = (
+            ", ".join(f'"{name}"' for name in history) if history else "none"
+        )
+        prompt = f"""Recommend the best movie from this list. Write a fun description (≤500 chars).
+Already watched (skip these): {history_text}
+Movies:
+{movie_list}
+Return ONLY JSON: {{"tmdb_id": <int>, "description": "<text>"}}"""
+
+    # Stage 2: LLM call (client has 15s timeout built in)
     client = _get_client()
+    result = None
+    try:
+        response = client.chat(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            format="json",
+            options={"num_predict": 200, "temperature": 0},
+        )
+        result = _parse_llm_response(response.message.content)
+    except Exception:
+        result = None
 
-    response = client.chat(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        format="json",
-        options={"num_predict": 200, "temperature": 0},
-    )
+    if result:
+        tmdb_id = int(result["tmdb_id"])
+        if tmdb_id not in VALID_IDS or tmdb_id in history_id_set:
+            result = None
 
-    result = _parse_llm_response(response.message.content)
-
-    # Safety: ensure tmdb_id is int and valid
-    tmdb_id = int(result["tmdb_id"])
-    if tmdb_id not in VALID_IDS or tmdb_id in history_id_set:
+    if not result:
+        # Fallback: pick the top-scored candidate
         fallback = candidates[~candidates["tmdb_id"].isin(history_id_set)].iloc[0]
         tmdb_id = int(fallback.tmdb_id)
+        description = (
+            f"You should watch \"{fallback.title}\" ({int(fallback.year)}) — "
+            f"a {fallback.genres.lower()} film"
+        )
+        if fallback.director:
+            description += f" by {fallback.director}"
+        if fallback.vote_average:
+            description += f", rated {fallback.vote_average}/10"
+        description += ". It's one of the most acclaimed movies in recent years."
+        return {"tmdb_id": tmdb_id, "description": description[:500]}
 
+    tmdb_id = int(result["tmdb_id"])
     description = str(result.get("description", ""))[:500]
 
     return {"tmdb_id": tmdb_id, "description": description}
