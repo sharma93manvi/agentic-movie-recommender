@@ -447,19 +447,22 @@ def get_recommendation(preferences: str, history: list[str], history_ids: list[i
 
     # Stage 1: Score and shortlist candidates
     scored = _score_movies(preferences, history_id_set)
-    candidates = scored.head(6)
 
     # Check if retrieval found any real signal (genre/text/theme matches)
-    top_row = candidates.iloc[0]
+    top_row = scored.iloc[0]
     has_signal = (top_row["_genre_score"] > 0 or top_row["_text_score"] > 0 or
                   top_row["_theme_score"] > 0 or top_row["_ref_score"] > 0)
 
     if has_signal:
+        candidates = scored.head(6)
         # Normal path: LLM picks from shortlisted candidates
         prompt = _build_prompt(preferences, history, history_ids, candidates)
     else:
-        # Low-signal path: input is vague/gibberish, use a simpler prompt
-        # with top-quality movies so the LLM doesn't overthink
+        # Low-signal path: pick a random sample from top 30 quality movies
+        # so we don't always recommend the same film for vague/gibberish input
+        import random
+        pool = scored.head(30)
+        candidates = pool.sample(n=min(6, len(pool)), random_state=random.randint(0, 99999))
         movie_blocks = []
         for row in candidates.itertuples():
             movie_blocks.append(f"- {_format_movie(row)}")
