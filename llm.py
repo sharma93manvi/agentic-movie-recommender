@@ -4,13 +4,16 @@ Movie recommendation agent — Hybrid retrieval + Chain-of-Thought + TMDB enrich
 Pipeline:
   1. Hybrid retrieval: semantic embeddings + TF-IDF keyword search + quality scoring
   2. Chain-of-thought LLM reasoning: analyze user intent → pick movie → write description
-  3. Optional TMDB API enrichment: fetch reviews/similar movies for richer descriptions
+  3. Optional TMDB API enrichment: fetch reviews for richer descriptions
 
 No hardcoded synonym dictionaries, stopword lists, or genre mappings.
 
 IMPORTANT: Do NOT hard-code your API key. The grader injects OLLAMA_API_KEY
 at runtime. This code reads it from the environment.
-# Optional: Set TMDB_API_KEY for review enrichment (not required).
+
+Additional environment variables (optional):
+  TMDB_API_KEY — If set, fetches real user reviews from TMDB to enrich descriptions.
+                 The system works fully without it.
 """
 
 import json
