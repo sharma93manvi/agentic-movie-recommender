@@ -148,6 +148,37 @@ TEST_CASES = [
         "history": [],
         "history_ids": [],
     },
+    # --- Gibberish & edge cases ---
+    {
+        "label": "pure gibberish",
+        "preferences": "xyzabc123 qwerty asdf",
+        "history": [],
+        "history_ids": [],
+    },
+    {
+        "label": "gibberish with hint",
+        "preferences": "sdvdsgcomdyj funnylol",
+        "history": [],
+        "history_ids": [],
+    },
+    {
+        "label": "single word",
+        "preferences": "robots",
+        "history": [],
+        "history_ids": [],
+    },
+    {
+        "label": "emoji only",
+        "preferences": "🎬🍿👻🔪",
+        "history": [],
+        "history_ids": [],
+    },
+    {
+        "label": "very long preference",
+        "preferences": "I want a movie that has great acting, amazing cinematography, a plot that keeps me on the edge of my seat, preferably with some humor mixed in, maybe set in a big city, with a strong female lead, and a twist ending that I won't see coming.",
+        "history": [],
+        "history_ids": [],
+    },
 ]
 
 
