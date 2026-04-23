@@ -87,6 +87,67 @@ TEST_CASES = [
         "history": [],
         "history_ids": [],
     },
+    # --- Additional diverse tests ---
+    {
+        "label": "date night",
+        "preferences": "Something fun for date night, not too heavy.",
+        "history": [],
+        "history_ids": [],
+    },
+    {
+        "label": "specific actor",
+        "preferences": "I love anything with Leonardo DiCaprio.",
+        "history": [],
+        "history_ids": [],
+    },
+    {
+        "label": "foreign language",
+        "preferences": "I want a great foreign language film, maybe Korean or Japanese.",
+        "history": ["Parasite"],
+        "history_ids": [496243],
+    },
+    {
+        "label": "nostalgia/90s-2000s vibe",
+        "preferences": "Something that gives me early 2010s nostalgia, like The Hunger Games era.",
+        "history": [],
+        "history_ids": [],
+    },
+    {
+        "label": "underrated gem",
+        "preferences": "Recommend me something underrated that most people haven't seen.",
+        "history": [],
+        "history_ids": [],
+    },
+    {
+        "label": "heavy watch history",
+        "preferences": "I want a great sci-fi movie.",
+        "history": ["Interstellar", "The Martian", "Arrival", "Dune", "Blade Runner 2049"],
+        "history_ids": [157336, 286217, 329865, 438631, 335984],
+    },
+    {
+        "label": "mood: rainy day",
+        "preferences": "It's a rainy Sunday, I want something cozy and slow-paced.",
+        "history": [],
+        "history_ids": [],
+    },
+    {
+        "label": "documentary",
+        "preferences": "I want a documentary that will blow my mind.",
+        "history": [],
+        "history_ids": [],
+    },
+    {
+        "label": "franchise/sequel",
+        "preferences": "I loved the first John Wick, what else should I watch?",
+        "history": ["John Wick"],
+        "history_ids": [245891],
+    },
+    {
+        "label": "anti-preference",
+        "preferences": "Anything but horror. I hate being scared.",
+        "history": [],
+        "history_ids": [],
+    },
 ]
 
 
