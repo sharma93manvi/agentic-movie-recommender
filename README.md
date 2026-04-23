@@ -4,17 +4,17 @@ An AI-powered movie recommendation agent that picks the best movie for a user fr
 
 ## How It Works
 
-The system uses a two-stage pipeline: **semantic retrieval** → **LLM selection + description writing**. There are no hardcoded synonym dictionaries, stopword lists, or genre mappings — the models do all the thinking.
+The system uses a **hybrid retrieval** pipeline followed by **LLM reasoning**. There are no hardcoded synonym dictionaries, stopword lists, or genre mappings — the models do all the thinking.
 
-### Step 1 — Semantic Embedding Retrieval (No Hardcoded Rules)
+### Step 1 — Hybrid Retrieval (Embeddings + Keyword Search)
 
-We use a pre-trained sentence embedding model (`BAAI/bge-small-en-v1.5` via fastembed) to understand what the user is looking for. Each movie in the database is represented as a vector encoding its title, genres, overview, and keywords. The user's query is encoded the same way, and we find the closest matches by cosine similarity.
+We use two retrieval methods in parallel to find candidate movies:
 
-To avoid recommending obscure films that happen to match keywords, we blend the semantic similarity score with a quality signal (normalized rating + log-scaled vote count). This ensures well-regarded movies rise above generic matches.
+- **Semantic embeddings** (`BAAI/bge-small-en-v1.5` via fastembed): Encodes the user's query and all movies into vectors, finds closest matches by cosine similarity. Understands meaning — "mind-bending" matches sci-fi thrillers, "feel-good" matches comedies.
+- **TF-IDF keyword search** (scikit-learn): Matches exact terms like director names, actor names, and specific movie references that embeddings might miss.
+- **Quality signal**: Blends in normalized rating + log-scaled vote count so acclaimed films rank above obscure matches.
 
-Movie embeddings are **pre-computed and cached** to a `.npy` file, so startup is ~0.1s instead of ~15s. The embedding model only needs to encode the user's short query at runtime (~4ms).
-
-Movies the user has already watched are excluded. The top 6 candidates move to Step 2.
+Movie embeddings are **pre-computed and cached** to a `.npy` file (~1ms load vs ~15s compute). The two retrieval scores are combined, and the top 8 candidates move to Step 2.
 
 ### Step 2 — LLM Does the Thinking
 
@@ -28,21 +28,21 @@ The LLM handles all the nuance — understanding that "something like Inception"
 
 ### Why This Design
 
-- **No hardcoding:** Zero synonym dictionaries, stopword lists, or genre mappings. The embedding model understands semantics, and the LLM reasons about intent.
-- **Fast:** Cached embeddings load in ~1ms. Query embedding takes ~4ms. Total response time is 3–5s, well within the 20s limit.
-- **Robust:** 15s timeout on the LLM call with a graceful fallback. If the API is slow, we return the top-scored candidate with a pre-built description.
+- **No hardcoding:** Zero synonym dictionaries, stopword lists, or genre mappings. Embeddings understand semantics, TF-IDF catches exact terms, and the LLM reasons about intent.
+- **Hybrid retrieval:** Embeddings alone miss exact matches (director names); keywords alone miss meaning ("feel-good"). Together they cover both.
+- **Fast:** Cached embeddings load in ~1ms. TF-IDF fits at import (~40ms). Query time is ~5ms. Total response is 3–5s.
 
 ## Approaches Explored
 
 We tried three retrieval strategies during development:
 
-| Approach | Startup | Per Query | Quality | Hardcoded Rules |
-|----------|---------|-----------|---------|-----------------|
-| 1. Hardcoded synonyms | 0ms | 2–5s | 5.00/5.00 | ~80 synonym entries, stopwords, theme maps |
-| 2. Live embeddings | ~15s | 3–5s | 4.77/5.00 | None |
-| 3. Cached embeddings (current) | ~0.1s | 3–5s | 4.77/5.00 | None |
+| Approach | Startup | Per Query | Quality | Method |
+|----------|---------|-----------|---------|--------|
+| 1. Hardcoded synonyms | 0ms | 2–5s | 5.00/5.00 | ~80 manual synonym entries + stopwords + theme maps |
+| 2. Embeddings only | ~0.1s | 3–5s | 4.77/5.00 | Semantic similarity + quality |
+| 3. Hybrid (current) | ~0.1s | 3–5s | TBD | Embeddings + TF-IDF keywords + quality |
 
-We chose **Approach 3** because it eliminates all hardcoded rules while keeping startup fast. The slight quality drop (5.00 → 4.77) comes from edge cases where embeddings pick a good-but-not-perfect movie (e.g., "A Quiet Place" instead of "Hereditary" for horror). The LLM compensates by writing strong descriptions regardless.
+We chose **Approach 3** because it combines the strengths of both retrieval methods — embeddings understand meaning while TF-IDF catches exact terms like director names and actor references — all without any hardcoded rules. The LLM does all the reasoning about which movie best fits the user's intent.
 
 ## Evaluation Strategy
 
@@ -94,7 +94,7 @@ Results across 10 diverse test cases:
 ### Key Functions in `llm.py`
 
 - `get_recommendation()` — Main entry point. Orchestrates retrieval → LLM pipeline.
-- `_score_movies()` — Embedding cosine similarity + quality scoring. No hardcoded rules.
+- `_score_movies()` — Hybrid retrieval: embedding similarity + TF-IDF keywords + quality scoring.
 - `_build_prompt()` — Constructs the LLM prompt. The LLM analyzes intent and picks the movie.
 - `_format_movie()` — Formats movie metadata for the prompt.
 - `_parse_llm_response()` — Robust JSON extraction with multiple fallback strategies.

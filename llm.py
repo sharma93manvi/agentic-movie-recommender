@@ -1,10 +1,11 @@
 """
-Movie recommendation agent — Embedding-based retrieval + LLM generation.
+Movie recommendation agent — Hybrid retrieval (embeddings + keyword search) + LLM.
 
-No hardcoded synonyms, stopwords, or genre mappings. The system uses:
-  1. Semantic embeddings (BAAI/bge-small-en-v1.5) to find similar movies
-  2. A quality signal (rating + vote count) to prefer acclaimed films
-  3. The LLM (gemma4:31b-cloud) to pick the best match and write a description
+Uses two retrieval methods in parallel, merges results, and lets the LLM pick:
+  1. Semantic embeddings (BAAI/bge-small-en-v1.5) for meaning-based matching
+  2. TF-IDF keyword search for exact term matching (directors, actors, titles)
+  3. Quality signal (rating + votes) to prefer acclaimed films
+  4. The LLM (gemma4:31b-cloud) reasons about the merged candidates
 
 IMPORTANT: Do NOT hard-code your API key. The grader injects OLLAMA_API_KEY
 at runtime. This code reads it from the environment.
@@ -21,6 +22,8 @@ import numpy as np
 import ollama
 import pandas as pd
 from fastembed import TextEmbedding
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity as sklearn_cosine
 
 load_dotenv()
 
@@ -46,16 +49,14 @@ for col in ["overview", "genres", "keywords", "director", "top_cast", "tagline",
 VALID_IDS = set(MOVIES_DF["tmdb_id"].astype(int))
 
 # ---------------------------------------------------------------------------
-# Embedding model + pre-computed movie embeddings
+# Retrieval Method 1: Semantic Embeddings (cached)
 # ---------------------------------------------------------------------------
 
 _EMBED_MODEL = TextEmbedding(EMBED_MODEL_NAME)
 
-# Load cached embeddings (pre-computed by running: python -c "see README")
 if os.path.exists(EMBEDDINGS_CACHE):
     _MOVIE_EMBEDDINGS = np.load(EMBEDDINGS_CACHE)
 else:
-    # Fallback: compute on the fly (slow, ~15s)
     _CORPUS = (
         MOVIES_DF["title"] + ". Genres: " + MOVIES_DF["genres"] + ". " +
         MOVIES_DF["overview"].str[:150] + " Keywords: " + MOVIES_DF["keywords"]
@@ -63,7 +64,27 @@ else:
     _MOVIE_EMBEDDINGS = np.array(list(_EMBED_MODEL.embed(_CORPUS)))
     np.save(EMBEDDINGS_CACHE, _MOVIE_EMBEDDINGS)
 
-# Pre-compute quality scores
+# ---------------------------------------------------------------------------
+# Retrieval Method 2: TF-IDF Keyword Search
+# ---------------------------------------------------------------------------
+
+_KEYWORD_CORPUS = (
+    MOVIES_DF["title"] + " " +
+    MOVIES_DF["genres"] + " " +
+    MOVIES_DF["keywords"] + " " +
+    MOVIES_DF["director"] + " " +
+    MOVIES_DF["top_cast"] + " " +
+    MOVIES_DF["overview"].str[:200] + " " +
+    MOVIES_DF["tagline"]
+).tolist()
+
+_TFIDF = TfidfVectorizer(stop_words="english", max_features=8000)
+_TFIDF_MATRIX = _TFIDF.fit_transform(_KEYWORD_CORPUS)
+
+# ---------------------------------------------------------------------------
+# Quality scores (pre-computed)
+# ---------------------------------------------------------------------------
+
 _VOTE_AVG = MOVIES_DF["vote_average"].clip(0, 10).values / 10.0
 _VOTE_LOG = np.log1p(MOVIES_DF["vote_count"].clip(0).values)
 _VOTE_LOG_MAX = _VOTE_LOG.max() if _VOTE_LOG.max() > 0 else 1
@@ -71,18 +92,28 @@ _QUALITY = _VOTE_AVG * 0.6 + (_VOTE_LOG / _VOTE_LOG_MAX) * 0.4
 
 
 # ---------------------------------------------------------------------------
-# Retrieval: embedding similarity + quality
+# Hybrid retrieval: embeddings + keywords + quality
 # ---------------------------------------------------------------------------
 
 def _score_movies(preferences: str, history_ids: set[int]) -> pd.DataFrame:
-    """Score movies using semantic similarity + quality. No hardcoded rules."""
+    """
+    Hybrid retrieval: combine semantic embeddings and keyword search.
+    The LLM gets candidates from both methods for richer coverage.
+    """
+    # Embedding similarity
     q_emb = np.array(list(_EMBED_MODEL.embed([preferences])))
-    similarity = np.dot(_MOVIE_EMBEDDINGS, q_emb.T).flatten()
+    embed_scores = np.dot(_MOVIE_EMBEDDINGS, q_emb.T).flatten()
 
+    # TF-IDF keyword similarity
+    q_tfidf = _TFIDF.transform([preferences])
+    keyword_scores = sklearn_cosine(q_tfidf, _TFIDF_MATRIX).flatten()
+
+    # Combine all signals
     df = MOVIES_DF.copy()
-    df["_embed_score"] = similarity * 5.0
-    df["_quality_score"] = _QUALITY * 2.0
-    df["_total_score"] = df["_embed_score"] + df["_quality_score"]
+    df["_embed_score"] = embed_scores * 5.0      # Semantic meaning
+    df["_keyword_score"] = keyword_scores * 4.0   # Exact term matches
+    df["_quality_score"] = _QUALITY * 2.0         # Rating + popularity
+    df["_total_score"] = df["_embed_score"] + df["_keyword_score"] + df["_quality_score"]
 
     # Exclude watched movies
     df = df[~df["tmdb_id"].isin(history_ids)]
@@ -120,7 +151,7 @@ def _format_movie(row) -> str:
 
 def _build_prompt(preferences: str, history: list[str], history_ids: list[int],
                   candidates: pd.DataFrame) -> str:
-    """Build the LLM prompt — the LLM does all the thinking."""
+    """Build the LLM prompt — the LLM does all the reasoning."""
     movie_blocks = []
     for row in candidates.itertuples():
         movie_blocks.append(f"- {_format_movie(row)}")
@@ -137,7 +168,7 @@ def _build_prompt(preferences: str, history: list[str], history_ids: list[int],
 User's request: "{preferences}"
 Movies they've already seen (do NOT recommend these): {history_text}
 
-Here are the candidate movies to choose from:
+Here are the candidate movies (found via semantic search and keyword matching):
 
 {movie_list}
 
@@ -178,9 +209,9 @@ def get_recommendation(preferences: str, history: list[str], history_ids: list[i
     """Return a dict with keys 'tmdb_id' (int) and 'description' (str)."""
     history_id_set = set(history_ids)
 
-    # Stage 1: Embedding retrieval — find semantically similar movies
+    # Stage 1: Hybrid retrieval — embeddings + keywords + quality
     scored = _score_movies(preferences, history_id_set)
-    candidates = scored.head(6)
+    candidates = scored.head(8)
 
     # Stage 2: LLM picks the best match and writes the pitch
     prompt = _build_prompt(preferences, history, history_ids, candidates)
