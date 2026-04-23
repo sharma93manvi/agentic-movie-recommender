@@ -1,14 +1,16 @@
 """
-Movie recommendation agent — Hybrid retrieval (embeddings + keyword search) + LLM.
+Movie recommendation agent — Hybrid retrieval + Chain-of-Thought + TMDB enrichment.
 
-Uses two retrieval methods in parallel, merges results, and lets the LLM pick:
-  1. Semantic embeddings (BAAI/bge-small-en-v1.5) for meaning-based matching
-  2. TF-IDF keyword search for exact term matching (directors, actors, titles)
-  3. Quality signal (rating + votes) to prefer acclaimed films
-  4. The LLM (gemma4:31b-cloud) reasons about the merged candidates
+Pipeline:
+  1. Hybrid retrieval: semantic embeddings + TF-IDF keyword search + quality scoring
+  2. Chain-of-thought LLM reasoning: analyze user intent → pick movie → write description
+  3. Optional TMDB API enrichment: fetch reviews/similar movies for richer descriptions
+
+No hardcoded synonym dictionaries, stopword lists, or genre mappings.
 
 IMPORTANT: Do NOT hard-code your API key. The grader injects OLLAMA_API_KEY
 at runtime. This code reads it from the environment.
+# Optional: Set TMDB_API_KEY for review enrichment (not required).
 """
 
 import json
@@ -21,6 +23,7 @@ from dotenv import load_dotenv
 import numpy as np
 import ollama
 import pandas as pd
+import requests
 from fastembed import TextEmbedding
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity as sklearn_cosine
@@ -121,6 +124,58 @@ def _score_movies(preferences: str, history_ids: set[int]) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# TMDB API enrichment (optional — uses TMDB_API_KEY if available)
+# ---------------------------------------------------------------------------
+
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
+
+
+def _fetch_tmdb_reviews(tmdb_id: int, max_reviews: int = 2) -> str:
+    """Fetch top user reviews from TMDB API. Returns empty string if unavailable."""
+    if not TMDB_API_KEY:
+        return ""
+    try:
+        url = f"https://api.themoviedb.org/3/movie/{tmdb_id}/reviews"
+        resp = requests.get(url, params={"api_key": TMDB_API_KEY}, timeout=3)
+        if resp.status_code != 200:
+            return ""
+        reviews = resp.json().get("results", [])[:max_reviews]
+        if not reviews:
+            return ""
+        snippets = []
+        for r in reviews:
+            content = r.get("content", "")[:150].strip()
+            author = r.get("author", "")
+            rating = r.get("author_details", {}).get("rating", "")
+            snippet = f'"{content}..."'
+            if author:
+                snippet += f" — {author}"
+            if rating:
+                snippet += f" ({rating}/10)"
+            snippets.append(snippet)
+        return "\n".join(snippets)
+    except Exception:
+        return ""
+
+
+def _fetch_tmdb_similar(tmdb_id: int, max_results: int = 3) -> str:
+    """Fetch similar movies from TMDB API. Returns empty string if unavailable."""
+    if not TMDB_API_KEY:
+        return ""
+    try:
+        url = f"https://api.themoviedb.org/3/movie/{tmdb_id}/similar"
+        resp = requests.get(url, params={"api_key": TMDB_API_KEY}, timeout=3)
+        if resp.status_code != 200:
+            return ""
+        results = resp.json().get("results", [])[:max_results]
+        if not results:
+            return ""
+        return ", ".join(r.get("title", "") for r in results if r.get("title"))
+    except Exception:
+        return ""
+
+
+# ---------------------------------------------------------------------------
 # LLM interaction
 # ---------------------------------------------------------------------------
 
@@ -172,12 +227,12 @@ Here are the candidate movies (found via semantic search and keyword matching):
 
 {movie_list}
 
-Your job:
-1. Analyze what the user is really looking for — consider genre, mood, themes, specific references, or any clues in their request.
-2. Pick the ONE movie from the candidates that best matches their intent.
-3. Write a compelling, personalized description (≤500 chars) that explains why THIS movie is perfect for what they asked for. Don't just summarize the plot — sell them on it.
+Think step by step:
+1. INTENT: What is the user really looking for? Consider genre, mood, themes, specific movie/director references, and emotional tone.
+2. MATCH: Which candidate best fits that intent? Consider how well the movie's genre, plot, director, cast, and rating align.
+3. SELL: Write a compelling, personalized description (≤500 chars) that connects THIS movie to THEIR specific request. Don't summarize the plot — explain why they'll love it.
 
-Return ONLY a JSON object: {{"tmdb_id": <int>, "description": "<text>"}}"""
+Return ONLY a JSON object: {{"reasoning": "<1-2 sentences on why you picked this>", "tmdb_id": <int>, "description": "<your pitch, ≤500 chars>"}}"""
 
 
 def _parse_llm_response(content: str) -> dict:
@@ -213,7 +268,7 @@ def get_recommendation(preferences: str, history: list[str], history_ids: list[i
     scored = _score_movies(preferences, history_id_set)
     candidates = scored.head(8)
 
-    # Stage 2: LLM picks the best match and writes the pitch
+    # Stage 2: Chain-of-thought LLM reasoning
     prompt = _build_prompt(preferences, history, history_ids, candidates)
     client = _get_client()
     result = None
@@ -222,7 +277,7 @@ def get_recommendation(preferences: str, history: list[str], history_ids: list[i
             model=MODEL,
             messages=[{"role": "user", "content": prompt}],
             format="json",
-            options={"num_predict": 200, "temperature": 0},
+            options={"num_predict": 300, "temperature": 0},
         )
         result = _parse_llm_response(response.message.content)
     except Exception:
@@ -248,8 +303,19 @@ def get_recommendation(preferences: str, history: list[str], history_ids: list[i
         return {"tmdb_id": tmdb_id, "description": description[:500]}
 
     tmdb_id = int(result["tmdb_id"])
-    description = str(result.get("description", ""))[:500]
-    return {"tmdb_id": tmdb_id, "description": description}
+    description = str(result.get("description", ""))
+
+    # Stage 3: Optional TMDB enrichment — enhance description with real reviews
+    if TMDB_API_KEY and len(description) < 400:
+        reviews = _fetch_tmdb_reviews(tmdb_id, max_reviews=1)
+        if reviews:
+            review_line = reviews.split("\n")[0]
+            # Only append if it fits within 500 chars
+            enriched = description.rstrip(".") + ". Critics agree: " + review_line
+            if len(enriched) <= 500:
+                description = enriched
+
+    return {"tmdb_id": tmdb_id, "description": description[:500]}
 
 
 # ---------------------------------------------------------------------------
