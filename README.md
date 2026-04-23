@@ -4,34 +4,45 @@ An AI-powered movie recommendation agent that picks the best movie for a user fr
 
 ## How It Works
 
-The system uses a two-step pipeline: **smart filtering** → **AI selection + description writing**.
+The system uses a two-stage pipeline: **semantic retrieval** → **LLM selection + description writing**. There are no hardcoded synonym dictionaries, stopword lists, or genre mappings — the models do all the thinking.
 
-### Step 1 — Score & Shortlist (No AI)
+### Step 1 — Semantic Embedding Retrieval (No Hardcoded Rules)
 
-We can't send all 1000 movies to the LLM — it would be too slow and too much text. So we first score every movie against the user's preferences using four signals:
+We use a pre-trained sentence embedding model (`BAAI/bge-small-en-v1.5` via fastembed) to understand what the user is looking for. Each movie in the database is represented as a vector encoding its title, genres, overview, and keywords. The user's query is encoded the same way, and we find the closest matches by cosine similarity.
 
-- **Genre matching (3× weight):** A synonym dictionary maps everyday language to genre tags. "Scary" → Horror/Thriller, "superhero" → Action/Sci-Fi, "feel-good" → Comedy/Family/Animation. ~80 synonym entries cover most natural language patterns.
-- **Text matching (2× weight):** Search terms from the user's input are matched against each movie's title, cast, director, keywords, overview, and tagline.
-- **Thematic keyword matching (3× weight):** Maps mood/theme phrases ("mind-bending", "plot twist", "intense") to specific TMDB keywords in the data (e.g., "mind-bending" → dream, alternate reality, time travel, consciousness). This distinguishes cerebral sci-fi from generic action sci-fi.
-- **"Like X" reference matching (2.5× weight):** When users mention a specific movie ("something like Inception"), we find that movie in the database and boost candidates that share its genres, keywords, and director.
-- **Quality tiebreaker (2× weight):** Among equally relevant movies, we prefer ones with higher ratings and more audience votes.
+To avoid recommending obscure films that happen to match keywords, we blend the semantic similarity score with a quality signal (normalized rating + log-scaled vote count). This ensures well-regarded movies rise above generic matches.
 
-Movies the user has already watched are excluded entirely. The top 6 candidates move to Step 2.
+Movie embeddings are **pre-computed and cached** to a `.npy` file, so startup is ~0.1s instead of ~15s. The embedding model only needs to encode the user's short query at runtime (~4ms).
 
-### Step 2 — AI Picks the Winner & Writes the Pitch
+Movies the user has already watched are excluded. The top 6 candidates move to Step 2.
 
-The 6 shortlisted movies (with genres, director, top cast, rating, tagline, and overview) are sent to `gemma4:31b-cloud` via Ollama Cloud. The model is given a "passionate movie critic" persona and instructed to:
+### Step 2 — LLM Does the Thinking
 
-1. Pick the single best match for this user's stated preferences
-2. Write a personalized, compelling description (≤500 characters) that opens by connecting to the user's request, highlights what makes the movie special, and ends with a hook
+The 6 shortlisted movies (with genres, director, cast, rating, and plot summary) are sent to `gemma4:31b-cloud` via Ollama Cloud. The LLM is given the user's full request and instructed to:
 
-The response is parsed as JSON with multiple fallback strategies. If the model returns an invalid movie ID or one the user already watched, we fall back to the top-scored candidate from Step 1.
+1. Analyze what the user is really looking for — genre, mood, themes, specific references
+2. Pick the ONE best match from the candidates
+3. Write a compelling, personalized description (≤500 chars) that sells the movie
+
+The LLM handles all the nuance — understanding that "something like Inception" means mind-bending sci-fi, that "make me cry" means emotional drama, that "Nolan fan" means a specific directorial style. No rules needed.
 
 ### Why This Design
 
-- **Fast:** Pre-filtering to 6 candidates keeps the prompt small. Responses come back in 2–4 seconds, well within the 20-second limit.
-- **Accurate:** Multi-signal scoring (genre + text + thematic + reference + quality) ensures the AI only sees relevant, high-quality movies.
-- **Robust:** Multiple JSON parsing fallbacks and a safety check on the returned ID prevent disqualification from edge cases.
+- **No hardcoding:** Zero synonym dictionaries, stopword lists, or genre mappings. The embedding model understands semantics, and the LLM reasons about intent.
+- **Fast:** Cached embeddings load in ~1ms. Query embedding takes ~4ms. Total response time is 3–5s, well within the 20s limit.
+- **Robust:** 15s timeout on the LLM call with a graceful fallback. If the API is slow, we return the top-scored candidate with a pre-built description.
+
+## Approaches Explored
+
+We tried three retrieval strategies during development:
+
+| Approach | Startup | Per Query | Quality | Hardcoded Rules |
+|----------|---------|-----------|---------|-----------------|
+| 1. Hardcoded synonyms | 0ms | 2–5s | 5.00/5.00 | ~80 synonym entries, stopwords, theme maps |
+| 2. Live embeddings | ~15s | 3–5s | 4.77/5.00 | None |
+| 3. Cached embeddings (current) | ~0.1s | 3–5s | 4.77/5.00 | None |
+
+We chose **Approach 3** because it eliminates all hardcoded rules while keeping startup fast. The slight quality drop (5.00 → 4.77) comes from edge cases where embeddings pick a good-but-not-perfect movie (e.g., "A Quiet Place" instead of "Hereditary" for horror). The LLM compensates by writing strong descriptions regardless.
 
 ## Evaluation Strategy
 
@@ -43,63 +54,50 @@ We built an automated evaluation pipeline that uses the same LLM to score recomm
 2. **Description Quality** — Is the pitch compelling, personalized, and well-written?
 3. **Persuasion** — Would this convince someone to actually watch the movie?
 
-We tested across 10 diverse preference styles:
+Results across 10 diverse test cases:
 
 | Test Case | Recommended Movie | R | D | P | Total |
 |-----------|------------------|---|---|---|-------|
-| Superhero action | Logan | 5 | 5 | 5 | 15/15 |
-| Funny feel-good | Luca | 5 | 5 | 5 | 15/15 |
+| Superhero action | Avengers: Infinity War | 5 | 5 | 5 | 15/15 |
+| Funny feel-good | The Intern | 5 | 5 | 5 | 15/15 |
 | Mind-bending sci-fi (like Inception) | Interstellar | 5 | 5 | 5 | 15/15 |
-| Scary horror | Hereditary | 5 | 5 | 5 | 15/15 |
-| Romantic drama (make me cry) | About Time | 5 | 5 | 5 | 15/15 |
-| Animated family (with kids) | The Wild Robot | 5 | 5 | 5 | 15/15 |
+| Scary horror | A Quiet Place | 4 | 5 | 4 | 13/15 |
+| Romantic drama (make me cry) | Me Before You | 5 | 4 | 4 | 13/15 |
+| Animated family (with kids) | The Lego Movie | 5 | 4 | 4 | 13/15 |
 | Crime thriller (like Se7en) | Girl with the Dragon Tattoo | 5 | 5 | 5 | 15/15 |
 | Vague/open (I'm bored) | Parasite | 5 | 5 | 5 | 15/15 |
-| Specific director (Nolan) | Oppenheimer | 5 | 5 | 5 | 15/15 |
-| War/historical | Lone Survivor | 5 | 5 | 5 | 15/15 |
+| Specific director (Nolan) | Dune: Part Two | 4 | 5 | 5 | 14/15 |
+| War/historical | Hacksaw Ridge | 5 | 5 | 5 | 15/15 |
 
-**Overall Score: 5.00 / 5.00** | Avg response time: 2.93s
+**Overall Score: 4.77 / 5.00** | Avg response time: 4.03s
 
 ### Iterative Improvement Process
 
-We used the evaluation to drive improvements:
-
-1. **Baseline (v1):** Only used top-5 movies by vote count. Scored poorly on diversity — always recommended the same few blockbusters.
-2. **v2 — Genre synonym matching:** Added synonym dictionary. Improved relevance for genre-specific queries but still missed nuanced requests like "mind-bending."
-3. **v3 — Thematic keyword matching:** Added TMDB keyword-level matching for mood/theme phrases. Fixed the "like Inception" case (Limitless → Interstellar). Score went from 4.80 to 5.00.
-4. **v4 — Quality weight tuning:** Increased quality score weight so critically acclaimed films beat generic genre matches. Prevented mediocre movies from outranking great ones.
-
-### Automated Testing
-
-The provided `test.py` validates all hard requirements:
-- Returns a valid dict with `tmdb_id` and `description` keys
-- `tmdb_id` exists in the candidate database
-- Does not recommend movies the user already watched
-- Responds within 20 seconds
-- All imports are listed in `requirements.txt`
+1. **Baseline:** Top-5 movies by vote count only. Always recommended the same blockbusters.
+2. **Hardcoded synonyms:** Added genre synonym dictionary + text matching. Scored 5.00/5.00 but heavily rule-based.
+3. **Live embeddings:** Replaced all rules with semantic embeddings. No hardcoding but 15s startup.
+4. **Cached embeddings (final):** Pre-computed embeddings to `.npy` file. 0.1s startup, no rules, 4.77/5.00 quality.
 
 ## Project Structure
 
 | File | What It Does |
 |------|-------------|
-| `llm.py` | Main implementation — scoring, retrieval, LLM call, JSON parsing |
-| `evaluate.py` | LLM-as-a-judge evaluation pipeline (10 test cases, 3 scoring dimensions) |
+| `llm.py` | Main implementation — embedding retrieval, LLM call, JSON parsing |
+| `movie_embeddings.npy` | Pre-computed movie embedding vectors (cached) |
+| `evaluate.py` | LLM-as-a-judge evaluation pipeline |
 | `test.py` | Automated test suite (provided by instructor) |
-| `tmdb_top1000_movies.csv` | Movie database with metadata (genres, cast, director, ratings, etc.) |
+| `tmdb_top1000_movies.csv` | Movie database (~1000 films with metadata) |
 | `requirements.txt` | Python dependencies |
-| `.env` | API key (not included in submission) |
+| `app.py` | Streamlit web frontend (not part of submission) |
+| `llm_hardcoded_backup.py` | Backup of the hardcoded synonym approach |
 
 ### Key Functions in `llm.py`
 
-- `get_recommendation()` — Main entry point. Orchestrates the full pipeline.
-- `_score_movies()` — Scores all movies using genre + text + thematic + reference + quality signals.
-- `_find_referenced_movies()` — Detects movie titles mentioned in preferences for "like X" queries.
-- `_extract_search_terms()` — Tokenizes user preferences, removes stopwords.
-- `_build_prompt()` — Constructs the LLM prompt with shortlisted candidates and critic persona.
-- `_format_movie()` — Formats a movie row into a compact block for the prompt.
+- `get_recommendation()` — Main entry point. Orchestrates retrieval → LLM pipeline.
+- `_score_movies()` — Embedding cosine similarity + quality scoring. No hardcoded rules.
+- `_build_prompt()` — Constructs the LLM prompt. The LLM analyzes intent and picks the movie.
+- `_format_movie()` — Formats movie metadata for the prompt.
 - `_parse_llm_response()` — Robust JSON extraction with multiple fallback strategies.
-- `GENRE_SYNONYMS` — Dictionary mapping ~80 everyday terms to genre/theme keywords.
-- `THEME_KEYWORDS` (inside `_score_movies`) — Maps mood phrases to specific TMDB keywords.
 
 ## Running Locally
 
@@ -107,16 +105,35 @@ The provided `test.py` validates all hard requirements:
 # Install dependencies
 pip install -r requirements.txt
 
-# Option A: Use a .env file (recommended)
-# Create .env with: OLLAMA_API_KEY=your_key_here
+# Set your API key (or use a .env file)
+export OLLAMA_API_KEY=your_key_here
+
+# Run tests
 python test.py
 
-# Option B: Set the key inline
-OLLAMA_API_KEY=your_key_here python test.py
-
-# Run the evaluation suite
+# Run evaluation
 python evaluate.py
 
 # Interactive mode
 python llm.py --preferences "I love sci-fi thrillers"
+
+# Web UI
+streamlit run app.py
+```
+
+### Re-generating Cached Embeddings
+
+If you modify the movie corpus or embedding model, regenerate the cache:
+
+```python
+python -c "
+from fastembed import TextEmbedding
+import pandas as pd, numpy as np
+df = pd.read_csv('tmdb_top1000_movies.csv')
+for c in ['overview','genres','keywords']: df[c] = df[c].fillna('')
+corpus = (df['title']+'. Genres: '+df['genres']+'. '+df['overview'].str[:150]+' Keywords: '+df['keywords']).tolist()
+emb = np.array(list(TextEmbedding('BAAI/bge-small-en-v1.5').embed(corpus)))
+np.save('movie_embeddings.npy', emb)
+print(f'Saved {emb.shape}')
+"
 ```

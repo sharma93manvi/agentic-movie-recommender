@@ -1,10 +1,10 @@
 """
-Movie recommendation agent.
+Movie recommendation agent — Embedding-based retrieval + LLM generation.
 
-Uses a two-stage approach:
-  1. Score-based retrieval to shortlist candidates from ~1000 movies
-  2. Single LLM call with rich movie context to pick the best match and
-     write a compelling, personalized description.
+No hardcoded synonyms, stopwords, or genre mappings. The system uses:
+  1. Semantic embeddings (BAAI/bge-small-en-v1.5) to find similar movies
+  2. A quality signal (rating + vote count) to prefer acclaimed films
+  3. The LLM (gemma4:31b-cloud) to pick the best match and write a description
 
 IMPORTANT: Do NOT hard-code your API key. The grader injects OLLAMA_API_KEY
 at runtime. This code reads it from the environment.
@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 import numpy as np
 import ollama
 import pandas as pd
+from fastembed import TextEmbedding
 
 load_dotenv()
 
@@ -28,331 +29,63 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 
 MODEL = "gemma4:31b-cloud"
+EMBED_MODEL_NAME = "BAAI/bge-small-en-v1.5"
+EMBEDDINGS_CACHE = os.path.join(os.path.dirname(__file__), "movie_embeddings.npy")
 
 DATA_PATH = os.path.join(os.path.dirname(__file__), "tmdb_top1000_movies.csv")
 MOVIES_DF = pd.read_csv(DATA_PATH)
 
-# Alias used by test.py — points to the full dataset
+# Alias used by test.py
 TOP_MOVIES = MOVIES_DF
 
-# Pre-process: fill NaN so string operations don't blow up
+# Pre-process: fill NaN
 for col in ["overview", "genres", "keywords", "director", "top_cast", "tagline", "us_rating"]:
     MOVIES_DF[col] = MOVIES_DF[col].fillna("")
 
-# Build a lowercase search corpus per movie for fast keyword matching
-MOVIES_DF["_search_blob"] = (
-    MOVIES_DF["title"].str.lower() + " " +
-    MOVIES_DF["genres"].str.lower() + " " +
-    MOVIES_DF["keywords"].str.lower() + " " +
-    MOVIES_DF["overview"].str.lower() + " " +
-    MOVIES_DF["director"].str.lower() + " " +
-    MOVIES_DF["top_cast"].str.lower() + " " +
-    MOVIES_DF["tagline"].str.lower()
-)
-
-# Build title lookup for "like X" reference matching
-TITLE_LOOKUP = {}
-for _, row in MOVIES_DF.iterrows():
-    TITLE_LOOKUP[row["title"].lower()] = row
-
-# Valid TMDB IDs (for safety check)
+# Valid TMDB IDs
 VALID_IDS = set(MOVIES_DF["tmdb_id"].astype(int))
 
-# Collect all unique genres for fuzzy matching
-ALL_GENRES = set()
-for g in MOVIES_DF["genres"].dropna():
-    for genre in g.split(", "):
-        genre = genre.strip().lower()
-        if genre:
-            ALL_GENRES.add(genre)
-
 # ---------------------------------------------------------------------------
-# Retrieval: score-based candidate shortlisting
+# Embedding model + pre-computed movie embeddings
 # ---------------------------------------------------------------------------
 
-# Synonyms / related terms → genre/theme keywords
-GENRE_SYNONYMS = {
-    # Superhero / comic book
-    "superhero": ["action", "science fiction", "superhero"],
-    "superheroes": ["action", "science fiction", "superhero"],
-    "marvel": ["action", "science fiction", "superhero", "marvel"],
-    "mcu": ["action", "science fiction", "superhero", "marvel"],
-    "dc": ["action", "science fiction", "superhero", "dc"],
-    "comic book": ["action", "science fiction", "superhero"],
-    # Horror
-    "scary": ["horror", "thriller"],
-    "spooky": ["horror"],
-    "creepy": ["horror", "thriller"],
-    "terrifying": ["horror", "thriller"],
-    "horror": ["horror"],
-    "slasher": ["horror"],
-    "haunted": ["horror", "mystery"],
-    "zombie": ["horror", "action"],
-    # Comedy
-    "funny": ["comedy"],
-    "hilarious": ["comedy"],
-    "laugh": ["comedy"],
-    "comedy": ["comedy"],
-    "witty": ["comedy", "drama"],
-    "lighthearted": ["comedy", "family"],
-    # Romance
-    "romantic": ["romance", "drama"],
-    "love": ["romance", "drama"],
-    "love story": ["romance"],
-    "romance": ["romance"],
-    # Feel-good / Family
-    "feel-good": ["comedy", "family", "animation"],
-    "feel good": ["comedy", "family", "animation"],
-    "heartwarming": ["drama", "family", "animation"],
-    "uplifting": ["drama", "comedy", "family"],
-    "wholesome": ["family", "comedy", "animation"],
-    # Animation
-    "animated": ["animation"],
-    "cartoon": ["animation"],
-    "pixar": ["animation", "family", "pixar"],
-    "disney": ["animation", "family", "disney"],
-    "anime": ["animation"],
-    "ghibli": ["animation", "fantasy"],
-    # Sci-fi / Mind-bending
-    "sci-fi": ["science fiction"],
-    "scifi": ["science fiction"],
-    "space": ["science fiction", "adventure"],
-    "mind-bending": ["science fiction", "thriller", "mystery"],
-    "mind bending": ["science fiction", "thriller", "mystery"],
-    "cerebral": ["science fiction", "thriller", "drama"],
-    "trippy": ["science fiction", "thriller", "mystery"],
-    "visually stunning": ["science fiction", "fantasy", "adventure"],
-    "thought-provoking": ["science fiction", "drama", "thriller"],
-    "thought provoking": ["science fiction", "drama", "thriller"],
-    "makes you think": ["science fiction", "thriller", "mystery"],
-    # Thriller / Suspense
-    "thriller": ["thriller"],
-    "suspense": ["thriller", "mystery"],
-    "suspenseful": ["thriller", "mystery"],
-    "tense": ["thriller", "drama"],
-    "intense": ["thriller", "action", "drama"],
-    "twist": ["thriller", "mystery"],
-    "plot twist": ["thriller", "mystery", "crime"],
-    # Crime
-    "crime": ["crime", "thriller"],
-    "detective": ["mystery", "crime"],
-    "heist": ["crime", "thriller", "heist"],
-    "murder": ["crime", "thriller", "mystery"],
-    "noir": ["crime", "thriller", "drama"],
-    # Action / Adventure
-    "action": ["action"],
-    "action-packed": ["action", "adventure"],
-    "adventure": ["adventure", "action"],
-    "epic": ["adventure", "action", "fantasy"],
-    "explosive": ["action", "thriller"],
-    # Drama
-    "drama": ["drama"],
-    "emotional": ["drama", "romance"],
-    "sad": ["drama"],
-    "tearjerker": ["drama", "romance"],
-    "cry": ["drama", "romance"],
-    "moving": ["drama"],
-    "powerful": ["drama", "history"],
-    # Fantasy
-    "fantasy": ["fantasy", "adventure"],
-    "magical": ["fantasy", "animation"],
-    "magic": ["fantasy"],
-    # War / History
-    "war": ["war", "action", "history"],
-    "historical": ["history", "drama"],
-    "history": ["history", "drama"],
-    "real events": ["history", "drama", "war"],
-    "true story": ["history", "drama"],
-    "based on": ["history", "drama"],
-    # Dark / Gritty
-    "dark": ["thriller", "drama", "crime"],
-    "gritty": ["crime", "drama", "thriller"],
-    "violent": ["action", "crime", "thriller"],
-    # Kids / Family
-    "kids": ["family", "animation"],
-    "children": ["family", "animation"],
-    "family-friendly": ["family", "animation"],
-    "family": ["family"],
-    # Music
-    "music": ["music"],
-    "musical": ["music"],
-    # Other
-    "western": ["western"],
-    "documentary": ["documentary"],
-    "mystery": ["mystery", "thriller"],
-    # Cerebral / intellectual
-    "intellectual": ["science fiction", "drama", "thriller"],
-    "complex": ["science fiction", "thriller", "drama"],
-    "philosophical": ["science fiction", "drama"],
-    "surreal": ["science fiction", "fantasy", "thriller"],
-    "dream": ["science fiction", "fantasy", "thriller"],
-    "reality": ["science fiction", "thriller"],
-    "time travel": ["science fiction", "adventure"],
-    "time": ["science fiction"],
-    "psychological": ["thriller", "drama", "mystery"],
-    "mindf": ["science fiction", "thriller", "mystery"],
-}
+_EMBED_MODEL = TextEmbedding(EMBED_MODEL_NAME)
+
+# Load cached embeddings (pre-computed by running: python -c "see README")
+if os.path.exists(EMBEDDINGS_CACHE):
+    _MOVIE_EMBEDDINGS = np.load(EMBEDDINGS_CACHE)
+else:
+    # Fallback: compute on the fly (slow, ~15s)
+    _CORPUS = (
+        MOVIES_DF["title"] + ". Genres: " + MOVIES_DF["genres"] + ". " +
+        MOVIES_DF["overview"].str[:150] + " Keywords: " + MOVIES_DF["keywords"]
+    ).tolist()
+    _MOVIE_EMBEDDINGS = np.array(list(_EMBED_MODEL.embed(_CORPUS)))
+    np.save(EMBEDDINGS_CACHE, _MOVIE_EMBEDDINGS)
+
+# Pre-compute quality scores
+_VOTE_AVG = MOVIES_DF["vote_average"].clip(0, 10).values / 10.0
+_VOTE_LOG = np.log1p(MOVIES_DF["vote_count"].clip(0).values)
+_VOTE_LOG_MAX = _VOTE_LOG.max() if _VOTE_LOG.max() > 0 else 1
+_QUALITY = _VOTE_AVG * 0.6 + (_VOTE_LOG / _VOTE_LOG_MAX) * 0.4
 
 
-def _extract_search_terms(preferences: str) -> list[str]:
-    """Extract meaningful search terms from user preferences."""
-    text = preferences.lower()
-    stopwords = {
-        "i", "me", "my", "want", "to", "watch", "see", "looking", "for",
-        "something", "a", "an", "the", "that", "is", "are", "was", "were",
-        "with", "and", "or", "but", "in", "of", "like", "really", "very",
-        "some", "would", "love", "enjoy", "prefer", "need", "feel", "mood",
-        "movie", "movies", "film", "films", "show", "shows", "think",
-        "about", "it", "its", "been", "have", "has", "had", "do", "does",
-        "can", "could", "should", "will", "just", "also", "too", "more",
-        "not", "no", "don't", "doesn't", "didn't", "won't", "wouldn't",
-        "maybe", "perhaps", "kind", "type", "sort", "bit", "lot", "lots",
-        "good", "great", "best", "nice", "cool", "awesome", "amazing",
-        "recommend", "recommendation", "suggest", "suggestion", "please",
-        "thanks", "thank", "you", "me", "we", "us", "our", "them", "they",
-        "this", "these", "those", "here", "there", "where", "when", "how",
-        "what", "which", "who", "whom", "why", "so", "if", "then", "than",
-        "from", "up", "down", "out", "on", "off", "over", "under", "again",
-        "once", "all", "any", "both", "each", "few", "many", "much", "own",
-        "same", "other", "such", "only", "into", "through", "during",
-        "before", "after", "above", "below", "between", "because", "while",
-        "give", "got", "get", "make", "makes",
-    }
-    words = re.findall(r"[a-z][a-z'-]+", text)
-    terms = [w for w in words if w not in stopwords and len(w) > 1]
-    return terms
-
-
-def _find_referenced_movies(preferences: str) -> list[dict]:
-    """Find movies mentioned by name in the preferences (for 'like X' queries)."""
-    pref_lower = preferences.lower()
-    referenced = []
-    # Sort by title length descending to match longer titles first
-    for title, row in sorted(TITLE_LOOKUP.items(), key=lambda x: -len(x[0])):
-        if title in pref_lower and len(title) > 3:  # skip very short titles
-            referenced.append(row)
-    return referenced
-
+# ---------------------------------------------------------------------------
+# Retrieval: embedding similarity + quality
+# ---------------------------------------------------------------------------
 
 def _score_movies(preferences: str, history_ids: set[int]) -> pd.DataFrame:
-    """Score all movies based on preference matching. Returns sorted DataFrame."""
+    """Score movies using semantic similarity + quality. No hardcoded rules."""
+    q_emb = np.array(list(_EMBED_MODEL.embed([preferences])))
+    similarity = np.dot(_MOVIE_EMBEDDINGS, q_emb.T).flatten()
+
     df = MOVIES_DF.copy()
+    df["_embed_score"] = similarity * 5.0
+    df["_quality_score"] = _QUALITY * 2.0
+    df["_total_score"] = df["_embed_score"] + df["_quality_score"]
+
+    # Exclude watched movies
     df = df[~df["tmdb_id"].isin(history_ids)]
-
-    pref_lower = preferences.lower()
-    search_terms = _extract_search_terms(preferences)
-
-    # --- Genre matching via synonyms ---
-    target_genres = set()
-    for term in search_terms:
-        if term in GENRE_SYNONYMS:
-            target_genres.update(GENRE_SYNONYMS[term])
-    # Also check multi-word synonym keys against full preference text
-    for key, genres in GENRE_SYNONYMS.items():
-        if key in pref_lower:
-            target_genres.update(genres)
-
-    # --- Fuzzy genre matching for typos/gibberish ---
-    # If no exact matches, try to detect genre hints in garbled text
-    if not target_genres:
-        for term in search_terms:
-            # Check if synonym keys appear as substrings
-            for key, genres in GENRE_SYNONYMS.items():
-                if len(key) >= 5 and key in term:
-                    target_genres.update(genres)
-            # Check if genre names appear as substrings
-            for genre in ALL_GENRES:
-                if len(genre) >= 5 and genre in term:
-                    target_genres.add(genre)
-
-    # --- "Like X" reference matching ---
-    # If user mentions a specific movie, boost movies with similar genres/keywords
-    referenced = _find_referenced_movies(preferences)
-    ref_genres = set()
-    ref_keywords = set()
-    for ref in referenced:
-        for g in str(ref.get("genres", "")).split(", "):
-            if g.strip():
-                ref_genres.add(g.strip().lower())
-        for kw in str(ref.get("keywords", "")).split(", "):
-            if kw.strip():
-                ref_keywords.add(kw.strip().lower())
-        # Also add the referenced movie's director as a search signal
-        director = str(ref.get("director", "")).lower()
-        if director:
-            search_terms.append(director)
-    target_genres.update(ref_genres)
-
-    genre_score = df["genres"].str.lower().apply(
-        lambda g: sum(1 for tg in target_genres if tg in g)
-    ) if target_genres else pd.Series(0, index=df.index)
-
-    # --- Keyword / text matching ---
-    text_score = df["_search_blob"].apply(
-        lambda blob: sum(1 for t in search_terms if t in blob)
-    )
-
-    # --- Thematic keyword matching ---
-    # Map user mood/theme words to TMDB keywords that appear in the data
-    THEME_KEYWORDS = {
-        "mind-bending": ["dream", "alternate reality", "time travel", "parallel universe",
-                         "simulation", "consciousness", "memory", "hallucination", "twist ending"],
-        "mind bending": ["dream", "alternate reality", "time travel", "parallel universe",
-                         "simulation", "consciousness", "memory", "hallucination", "twist ending"],
-        "visually stunning": ["visual effects", "imax", "3d", "cgi", "cinematography"],
-        "makes you think": ["philosophical", "existential", "moral dilemma", "dystopia",
-                            "artificial intelligence", "consciousness"],
-        "cerebral": ["philosophical", "existential", "moral dilemma", "consciousness",
-                     "twist ending", "nonlinear timeline"],
-        "thought-provoking": ["philosophical", "existential", "moral dilemma", "dystopia",
-                              "social commentary"],
-        "emotional": ["loss of loved one", "grief", "family", "father son relationship",
-                      "father daughter relationship", "mother son relationship"],
-        "heartwarming": ["friendship", "family", "coming of age", "redemption"],
-        "intense": ["survival", "hostage", "escape", "chase", "race against time"],
-        "scary": ["haunted house", "ghost", "demon", "possession", "serial killer",
-                   "slasher", "supernatural", "paranormal"],
-        "dark": ["serial killer", "revenge", "corruption", "conspiracy", "noir"],
-        "epic": ["war", "battle", "kingdom", "empire", "quest", "prophecy"],
-        "twist": ["twist ending", "plot twist", "unreliable narrator", "surprise ending"],
-        "plot twist": ["twist ending", "plot twist", "unreliable narrator", "surprise ending"],
-    }
-    theme_terms = set()
-    for key, kws in THEME_KEYWORDS.items():
-        if key in pref_lower:
-            theme_terms.update(kws)
-
-    theme_score = pd.Series(0.0, index=df.index)
-    if theme_terms:
-        theme_score = df["keywords"].str.lower().apply(
-            lambda kw: sum(1 for t in theme_terms if t in kw)
-        )
-
-    # --- Reference keyword matching (bonus for "like X" queries) ---
-    ref_score = pd.Series(0, index=df.index)
-    if ref_keywords:
-        ref_score = df["keywords"].str.lower().apply(
-            lambda kw: sum(1 for rk in ref_keywords if rk in kw)
-        )
-
-    # --- Quality signal ---
-    vote_avg_norm = df["vote_average"].clip(0, 10) / 10.0
-    vote_count_log = np.log1p(df["vote_count"].clip(0))
-    max_log = vote_count_log.max() if vote_count_log.max() > 0 else 1
-    vote_count_norm = vote_count_log / max_log
-    quality_score = vote_avg_norm * 0.6 + vote_count_norm * 0.4
-
-    # --- Combine scores ---
-    df = df.copy()
-    df["_genre_score"] = genre_score * 3.0
-    df["_text_score"] = text_score * 2.0
-    df["_theme_score"] = theme_score * 3.0    # Thematic keyword matching
-    df["_ref_score"] = ref_score * 2.5        # "Like X" keyword similarity
-    df["_quality_score"] = quality_score * 2.0
-    df["_total_score"] = (df["_genre_score"] + df["_text_score"] +
-                          df["_theme_score"] + df["_ref_score"] +
-                          df["_quality_score"])
-
     return df.sort_values("_total_score", ascending=False)
 
 
@@ -361,7 +94,6 @@ def _score_movies(preferences: str, history_ids: set[int]) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def _get_client() -> ollama.Client:
-    """Create an Ollama client with the API key from environment."""
     return ollama.Client(
         host="https://ollama.com",
         headers={"Authorization": f"Bearer {os.environ['OLLAMA_API_KEY']}"},
@@ -370,7 +102,7 @@ def _get_client() -> ollama.Client:
 
 
 def _format_movie(row) -> str:
-    """Format a single movie row into a compact but informative block for the LLM."""
+    """Format a movie row for the LLM prompt."""
     parts = [f'tmdb_id={row.tmdb_id} | "{row.title}" ({row.year})']
     if row.genres:
         parts.append(f"Genres: {row.genres}")
@@ -388,7 +120,7 @@ def _format_movie(row) -> str:
 
 def _build_prompt(preferences: str, history: list[str], history_ids: list[int],
                   candidates: pd.DataFrame) -> str:
-    """Build the recommendation prompt with shortlisted candidates."""
+    """Build the LLM prompt — the LLM does all the thinking."""
     movie_blocks = []
     for row in candidates.itertuples():
         movie_blocks.append(f"- {_format_movie(row)}")
@@ -400,41 +132,42 @@ def _build_prompt(preferences: str, history: list[str], history_ids: list[int],
         ) if history else "none"
     )
 
-    prompt = f"""Pick the best movie for this user. Write a compelling, personalized description (≤500 chars).
+    return f"""You are a movie recommendation expert. A user needs your help picking a movie.
 
-User wants: "{preferences}"
-Already watched (do NOT pick): {history_text}
+User's request: "{preferences}"
+Movies they've already seen (do NOT recommend these): {history_text}
 
-Candidates:
+Here are the candidate movies to choose from:
+
 {movie_list}
 
-Pick one. Connect description to their preferences. Be specific and engaging.
-Return ONLY JSON: {{"tmdb_id": <int>, "description": "<text>"}}"""
-    return prompt
+Your job:
+1. Analyze what the user is really looking for — consider genre, mood, themes, specific references, or any clues in their request.
+2. Pick the ONE movie from the candidates that best matches their intent.
+3. Write a compelling, personalized description (≤500 chars) that explains why THIS movie is perfect for what they asked for. Don't just summarize the plot — sell them on it.
+
+Return ONLY a JSON object: {{"tmdb_id": <int>, "description": "<text>"}}"""
 
 
 def _parse_llm_response(content: str) -> dict:
-    """Parse the LLM response, handling common formatting issues."""
+    """Parse LLM response with fallbacks for formatting quirks."""
     try:
         return json.loads(content)
     except json.JSONDecodeError:
         pass
-
     match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
     if match:
         try:
             return json.loads(match.group(1))
         except json.JSONDecodeError:
             pass
-
     match = re.search(r"\{[^{}]*\"tmdb_id\"[^{}]*\}", content, re.DOTALL)
     if match:
         try:
             return json.loads(match.group(0))
         except json.JSONDecodeError:
             pass
-
-    raise ValueError(f"Could not parse LLM response as JSON: {content[:200]}")
+    raise ValueError(f"Could not parse LLM response: {content[:200]}")
 
 
 # ---------------------------------------------------------------------------
@@ -445,38 +178,12 @@ def get_recommendation(preferences: str, history: list[str], history_ids: list[i
     """Return a dict with keys 'tmdb_id' (int) and 'description' (str)."""
     history_id_set = set(history_ids)
 
-    # Stage 1: Score and shortlist candidates
+    # Stage 1: Embedding retrieval — find semantically similar movies
     scored = _score_movies(preferences, history_id_set)
+    candidates = scored.head(6)
 
-    # Check if retrieval found any real signal (genre/text/theme matches)
-    top_row = scored.iloc[0]
-    has_signal = (top_row["_genre_score"] > 0 or top_row["_text_score"] > 0 or
-                  top_row["_theme_score"] > 0 or top_row["_ref_score"] > 0)
-
-    if has_signal:
-        candidates = scored.head(6)
-        # Normal path: LLM picks from shortlisted candidates
-        prompt = _build_prompt(preferences, history, history_ids, candidates)
-    else:
-        # Low-signal path: pick a random sample from top 30 quality movies
-        # so we don't always recommend the same film for vague/gibberish input
-        import random
-        pool = scored.head(30)
-        candidates = pool.sample(n=min(6, len(pool)), random_state=random.randint(0, 99999))
-        movie_blocks = []
-        for row in candidates.itertuples():
-            movie_blocks.append(f"- {_format_movie(row)}")
-        movie_list = "\n".join(movie_blocks)
-        history_text = (
-            ", ".join(f'"{name}"' for name in history) if history else "none"
-        )
-        prompt = f"""Recommend the best movie from this list. Write a fun description (≤500 chars).
-Already watched (skip these): {history_text}
-Movies:
-{movie_list}
-Return ONLY JSON: {{"tmdb_id": <int>, "description": "<text>"}}"""
-
-    # Stage 2: LLM call (client has 15s timeout built in)
+    # Stage 2: LLM picks the best match and writes the pitch
+    prompt = _build_prompt(preferences, history, history_ids, candidates)
     client = _get_client()
     result = None
     try:
@@ -496,8 +203,7 @@ Return ONLY JSON: {{"tmdb_id": <int>, "description": "<text>"}}"""
             result = None
 
     if not result:
-        # Fallback: pick the top-scored candidate
-        fallback = candidates[~candidates["tmdb_id"].isin(history_id_set)].iloc[0]
+        fallback = candidates.iloc[0]
         tmdb_id = int(fallback.tmdb_id)
         description = (
             f"You should watch \"{fallback.title}\" ({int(fallback.year)}) — "
@@ -512,30 +218,20 @@ Return ONLY JSON: {{"tmdb_id": <int>, "description": "<text>"}}"""
 
     tmdb_id = int(result["tmdb_id"])
     description = str(result.get("description", ""))[:500]
-
     return {"tmdb_id": tmdb_id, "description": description}
 
 
 # ---------------------------------------------------------------------------
-# CLI for local testing
+# CLI
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Run a local movie recommendation test."
-    )
-    parser.add_argument(
-        "--preferences", type=str,
-        help="User preferences text. If omitted, you will be prompted.",
-    )
-    parser.add_argument(
-        "--history", type=str,
-        help='Comma-separated watch history titles. Example: "The Avengers, Up"',
-    )
+    parser = argparse.ArgumentParser(description="Movie recommendation agent.")
+    parser.add_argument("--preferences", type=str)
+    parser.add_argument("--history", type=str)
     args = parser.parse_args()
 
     print("Movie recommender – type your preferences and press Enter.")
-
     preferences = (
         args.preferences.strip()
         if args.preferences and args.preferences.strip()
@@ -546,16 +242,11 @@ if __name__ == "__main__":
         if args.history and args.history.strip()
         else input("Watch history (optional): ").strip()
     )
-    history = (
-        [t.strip() for t in history_raw.split(",") if t.strip()]
-        if history_raw
-        else []
-    )
+    history = [t.strip() for t in history_raw.split(",") if t.strip()] if history_raw else []
 
     print("\nThinking...\n")
     start = time.perf_counter()
     result = get_recommendation(preferences, history)
     elapsed = time.perf_counter() - start
-
     print(json.dumps(result, indent=2))
     print(f"\nServed in {elapsed:.2f}s")

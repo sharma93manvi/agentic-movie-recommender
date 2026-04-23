@@ -5,3 +5,4 @@ pandas>=2.0.0
 numpy>=1.24.0
 ollama
 python-dotenv>=1.0.0
+fastembed>=0.8.0
