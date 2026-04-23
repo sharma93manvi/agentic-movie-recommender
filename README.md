@@ -1,60 +1,56 @@
 # Agentic Movie Recommender
 
-AI-powered movie recommendation agent. Picks the best movie from ~1000 films and writes a personalized pitch to convince you to watch it.
+Recommends movies from a database of ~1000 popular films and writes a personalized pitch to convince you to watch it.
 
-## Pipeline
+## How It Works
 
-Three stages, no hardcoded rules — the models do all the thinking.
+Three stages, no hardcoded rules.
 
 ### 1. Hybrid Retrieval
 
-Two retrieval methods run in parallel to find candidates:
+Two methods find candidates in parallel:
 
-- **Semantic embeddings** (BAAI/bge-small-en-v1.5): Understands meaning — "mind-bending" finds sci-fi thrillers, "feel-good" finds comedies. Pre-computed and cached to `.npy` for fast loading (~1ms).
-- **TF-IDF keyword search**: Catches exact terms embeddings miss — director names, actor names, movie title references.
-- **Quality signal**: Rating + vote count blend so acclaimed films rank above obscure matches.
+- **Semantic embeddings** (BAAI/bge-small-en-v1.5) — understands meaning. "Mind-bending" finds sci-fi thrillers, "feel-good" finds comedies. Pre-computed and cached for fast loading.
+- **TF-IDF keyword search** — catches exact terms like director names, actor names, and movie references.
+- **Quality signal** — rating + vote count so well-known films rank higher.
 
-Scores are combined. Top 8 candidates go to the LLM.
+Top 8 candidates go to the LLM.
 
 ### 2. Chain-of-Thought LLM Reasoning
 
-The LLM (`gemma4:31b-cloud`) follows a structured reasoning process:
+The LLM (`gemma4:31b-cloud`) reasons step by step:
 
-1. **INTENT** — What is the user really looking for? (genre, mood, themes, references)
-2. **MATCH** — Which candidate best fits that intent?
-3. **SELL** — Write a personalized description (≤500 chars) that connects the movie to their request
-
-This produces better picks than a simple "choose one" prompt because the model explicitly reasons before deciding.
+1. **INTENT** — What does the user actually want?
+2. **MATCH** — Which candidate fits best?
+3. **SELL** — Write a personalized pitch (≤500 chars)
 
 ### 3. TMDB API Enrichment (Optional)
 
-After the LLM picks a movie, we fetch real user reviews from the TMDB API and append a critic quote to the description. Adds credibility. Works without the key too.
+If `TMDB_API_KEY` is set, fetches real user reviews from TMDB and appends a critic quote to the description. Works without it too.
 
 ## Evaluation
 
-Built an LLM-as-a-judge pipeline (`evaluate.py`) — 25 test cases scored on relevance, description quality, and persuasion (1-5 each).
+LLM-as-a-judge pipeline (`evaluate.py`) — 25 test cases scored on relevance, description quality, and persuasion.
 
-**Standard preferences (15 tests):** Avg 14.1/15 — strong picks for superhero, comedy, horror, romance, thriller, war, date night, specific actors/directors, foreign language, etc.
+| Example query | Recommended | Score |
+|---|---|---|
+| "I love action movies with superheroes" | Spider-Man: Into the Spider-Verse | 14/15 |
+| "Something like Inception — mind-bending" | Interstellar | 15/15 |
+| "I love crime thrillers like Se7en" | The Girl with the Dragon Tattoo | 15/15 |
+| "I love Christopher Nolan movies" | Oppenheimer | 13/15 |
+| "robots" (single word) | The Wild Robot | 14/15 |
+| "sdvdsgcomdyj funnylol" (gibberish) | We're the Millers | 13/15 |
 
-**Edge cases (10 tests):** Handles gibberish, emojis, single words, very long inputs. Graceful fallback — never crashes, always under 20s.
+Handles gibberish, emojis, single words, and long inputs gracefully.
 
-| Highlight picks | |
-|---|---|
-| "I love action movies with superheroes" | Spider-Man: Into the Spider-Verse (14/15) |
-| "Something like Inception — mind-bending" | Interstellar (15/15) |
-| "I love crime thrillers like Se7en" | The Girl with the Dragon Tattoo (15/15) |
-| "I love Christopher Nolan movies" | Oppenheimer (13/15) |
-| "robots" (single word) | The Wild Robot (14/15) |
-| "sdvdsgcomdyj funnylol" (gibberish) | We're the Millers (13/15) |
+## How We Got Here
 
-## Iteration Journey
-
-1. **Baseline** — Top 5 by vote count. Same movies every time.
-2. **Hardcoded synonyms** — 80 manual genre mappings. 5.00/5.00 but heavily rule-based.
-3. **Cached embeddings** — Replaced all rules. 0.1s startup, no hardcoding.
-4. **Hybrid retrieval** — Added TF-IDF for exact term matching alongside embeddings.
-5. **Chain-of-thought** — Structured LLM reasoning (INTENT → MATCH → SELL).
-6. **TMDB API** — Real user reviews to enrich descriptions.
+1. Started with top 5 movies by vote count — same recommendations every time.
+2. Added hardcoded synonym mappings — good results but too rule-based.
+3. Switched to cached semantic embeddings — no hardcoding, fast startup.
+4. Added TF-IDF keyword search alongside embeddings for better coverage.
+5. Added chain-of-thought prompting for smarter LLM reasoning.
+6. Integrated TMDB API for real critic reviews.
 
 ## Running
 
@@ -63,8 +59,8 @@ pip install -r requirements.txt
 export OLLAMA_API_KEY=your_key_here        # required
 export TMDB_API_KEY=your_tmdb_key_here     # optional
 
-python test.py                              # run tests
-python evaluate.py                          # run 25-case evaluation
+python test.py                              # grader tests
+python evaluate.py                          # 25-case evaluation
 python llm.py --preferences "sci-fi"        # interactive
 streamlit run app.py                        # web UI
 ```
@@ -73,9 +69,9 @@ streamlit run app.py                        # web UI
 
 | File | Purpose |
 |------|---------|
-| `llm.py` | Main agent — hybrid retrieval, chain-of-thought LLM, TMDB enrichment |
-| `movie_embeddings.npy` | Cached movie embedding vectors |
-| `evaluate.py` | LLM-as-a-judge evaluation (25 tests) |
+| `llm.py` | Main agent |
+| `movie_embeddings.npy` | Cached embeddings |
+| `evaluate.py` | Evaluation pipeline (25 tests) |
 | `test.py` | Grader test suite |
 | `tmdb_top1000_movies.csv` | Movie database |
-| `app.py` | Streamlit web frontend |
+| `app.py` | Streamlit frontend |
