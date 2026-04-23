@@ -180,9 +180,12 @@ def _fetch_tmdb_similar(tmdb_id: int, max_results: int = 3) -> str:
 # ---------------------------------------------------------------------------
 
 def _get_client() -> ollama.Client:
+    api_key = os.environ.get("OLLAMA_API_KEY", "")
+    if not api_key:
+        raise ValueError("OLLAMA_API_KEY not set. Add it to your .env file.")
     return ollama.Client(
         host="https://ollama.com",
-        headers={"Authorization": f"Bearer {os.environ['OLLAMA_API_KEY']}"},
+        headers={"Authorization": f"Bearer {api_key}"},
         timeout=15.0,
     )
 
